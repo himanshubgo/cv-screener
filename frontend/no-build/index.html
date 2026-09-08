@@ -1,0 +1,647 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CV Screener</title>
+  <!-- Tailwind's "Play CDN" - compiles utility classes in the browser, no build step. -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- React 18 + Babel standalone (in-browser JSX/TS transform) - no Node/npm needed. -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone@7/babel.min.js" crossorigin></script>
+  <style>
+    html { color-scheme: light; }
+    body { background: #f8fafc; color: #0f172a; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel" data-presets="react">
+    const { useState, useEffect, useMemo } = React;
+
+    // ---------------------------------------------------------------------
+    // API client - mirrors frontend/src/api.ts, talking to api.py.
+    // ---------------------------------------------------------------------
+    // If this page isn't served from the same origin as the API (it won't be -
+    // this is a static file server, the API is uvicorn on :8000), call it by
+    // full URL. Change API_BASE if you run uvicorn on a different port.
+    const API_BASE = "http://127.0.0.1:8000";
+
+    async function fetchHealth() {
+      const res = await fetch(`${API_BASE}/api/health`);
+      if (!res.ok) throw new Error(`health check failed: ${res.status}`);
+      return res.json();
+    }
+
+    async function screenText(filename, cvText) {
+      try {
+        const res = await fetch(`${API_BASE}/api/screen-text`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ filename, cv_text: cvText }),
+        });
+        if (!res.ok) {
+          const detail = await res.text().catch(() => "");
+          return { id: filename, filename, status: "error", error: `request failed (${res.status}): ${detail}` };
+        }
+        return await res.json();
+      } catch (e) {
+        return { id: filename, filename, status: "error", error: e instanceof Error ? e.message : "network error" };
+      }
+    }
+
+    function readFileAsText(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result ?? ""));
+        reader.onerror = () => reject(reader.error ?? new Error(`could not read ${file.name}`));
+        reader.readAsText(file);
+      });
+    }
+
+    // Run `items` through `worker` with at most `limit` in flight, so results
+    // land progressively rather than all at once.
+    async function runPool(items, limit, worker) {
+      let next = 0;
+      const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+        while (next < items.length) {
+          const item = items[next++];
+          await worker(item);
+        }
+      });
+      await Promise.all(runners);
+    }
+
+    function newId() {
+      return typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
+    }
+
+    // ---------------------------------------------------------------------
+    // Badges
+    // ---------------------------------------------------------------------
+    const RECOMMENDATION_STYLES = {
+      advance: "bg-emerald-100 text-emerald-800 ring-emerald-600/20",
+      hold: "bg-amber-100 text-amber-800 ring-amber-600/20",
+      reject: "bg-rose-100 text-rose-800 ring-rose-600/20",
+    };
+
+    function RecommendationBadge({ value }) {
+      return (
+        <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-semibold uppercase tracking-wide ring-1 ring-inset ${RECOMMENDATION_STYLES[value]}`}>
+          {value}
+        </span>
+      );
+    }
+
+    const VERDICT_STYLES = {
+      strong: "bg-emerald-50 text-emerald-700 ring-emerald-600/20",
+      adequate: "bg-sky-50 text-sky-700 ring-sky-600/20",
+      weak: "bg-amber-50 text-amber-700 ring-amber-600/20",
+      missing: "bg-slate-100 text-slate-600 ring-slate-500/20",
+    };
+
+    function VerdictBadge({ value }) {
+      return (
+        <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium capitalize ring-1 ring-inset ${VERDICT_STYLES[value]}`}>
+          {value}
+        </span>
+      );
+    }
+
+    function ScoreBar({ score, recommendation }) {
+      const barColor = recommendation === "advance" ? "bg-emerald-500" : recommendation === "hold" ? "bg-amber-500" : "bg-rose-500";
+      return (
+        <div className="flex items-center gap-2">
+          <div className="h-2 w-24 overflow-hidden rounded-full bg-slate-200">
+            <div className={`h-full rounded-full ${barColor}`} style={{ width: `${Math.max(0, Math.min(100, score))}%` }} />
+          </div>
+          <span className="w-8 text-right text-sm font-medium tabular-nums text-slate-700">{score}</span>
+        </div>
+      );
+    }
+
+    function HumanReviewBadge() {
+      return (
+        <span className="inline-flex items-center gap-1 rounded-full bg-purple-100 px-2.5 py-0.5 text-xs font-semibold text-purple-800 ring-1 ring-inset ring-purple-600/20">
+          Needs human review
+        </span>
+      );
+    }
+
+    // ---------------------------------------------------------------------
+    // Header
+    // ---------------------------------------------------------------------
+    function Header({ health }) {
+      return (
+        <header className="border-b border-slate-200 bg-white">
+          <div className="mx-auto flex max-w-7xl items-center justify-between px-6 py-4">
+            <div className="flex items-center gap-4">
+              <img src="logo.webp" alt="Bill Gosling Outsourcing" className="h-9 w-auto" />
+              <div>
+                <h1 className="text-xl font-bold tracking-tight text-slate-900">CV Screener</h1>
+                <p className="text-sm text-slate-500">Call-centre-agent fitness screening, scored against 7 weighted criteria.</p>
+              </div>
+            </div>
+            {health && !health.has_api_key && (
+              <div className="rounded-md bg-amber-50 px-3 py-2 text-sm text-amber-800 ring-1 ring-inset ring-amber-600/20">
+                ANTHROPIC_API_KEY is not set on the backend - screening requests will fail.
+              </div>
+            )}
+          </div>
+        </header>
+      );
+    }
+
+    // ---------------------------------------------------------------------
+    // Upload panel
+    // ---------------------------------------------------------------------
+    function UploadPanel({ onScreen, isScreening, progress, candidateCount, onClear }) {
+      const [pending, setPending] = useState([]);
+      const [isDragOver, setIsDragOver] = useState(false);
+      const inputRef = React.useRef(null);
+
+      function addFiles(files) {
+        const incoming = Array.from(files).filter((f) => f.name.toLowerCase().endsWith(".txt"));
+        setPending((prev) => {
+          const existing = new Set(prev.map((f) => `${f.name}:${f.size}`));
+          const merged = [...prev];
+          for (const f of incoming) {
+            const key = `${f.name}:${f.size}`;
+            if (!existing.has(key)) {
+              merged.push(f);
+              existing.add(key);
+            }
+          }
+          return merged;
+        });
+      }
+
+      function handleDrop(e) {
+        e.preventDefault();
+        setIsDragOver(false);
+        if (e.dataTransfer.files?.length) addFiles(e.dataTransfer.files);
+      }
+
+      function removePending(name) {
+        setPending((prev) => prev.filter((f) => f.name !== name));
+      }
+
+      function handleScreen() {
+        if (pending.length === 0) return;
+        onScreen(pending);
+        setPending([]);
+      }
+
+      return (
+        <div className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm">
+          <div className="mb-3 flex items-center justify-between">
+            <h2 className="text-sm font-semibold text-slate-900">Import CVs</h2>
+            {candidateCount > 0 && (
+              <button onClick={onClear} disabled={isScreening} className="text-xs font-medium text-slate-500 hover:text-rose-600 disabled:cursor-not-allowed disabled:opacity-50">
+                Clear shortlist ({candidateCount})
+              </button>
+            )}
+          </div>
+
+          <div
+            onDragOver={(e) => { e.preventDefault(); setIsDragOver(true); }}
+            onDragLeave={() => setIsDragOver(false)}
+            onDrop={handleDrop}
+            onClick={() => inputRef.current?.click()}
+            className={`flex cursor-pointer flex-col items-center justify-center rounded-md border-2 border-dashed px-4 py-8 text-center transition-colors ${isDragOver ? "border-indigo-400 bg-indigo-50" : "border-slate-300 bg-slate-50 hover:bg-slate-100"}`}
+          >
+            <p className="text-sm font-medium text-slate-700">Drop plain-text CVs here, or click to browse</p>
+            <p className="mt-1 text-xs text-slate-500">.txt files only, one candidate per file</p>
+            <input
+              ref={inputRef}
+              type="file"
+              accept=".txt,text/plain"
+              multiple
+              className="hidden"
+              onChange={(e) => { if (e.target.files?.length) addFiles(e.target.files); e.target.value = ""; }}
+            />
+          </div>
+
+          {pending.length > 0 && (
+            <ul className="mt-3 max-h-40 space-y-1 overflow-y-auto">
+              {pending.map((f) => (
+                <li key={f.name} className="flex items-center justify-between rounded bg-slate-50 px-2 py-1 text-xs text-slate-600">
+                  <span className="truncate">{f.name}</span>
+                  <button onClick={(e) => { e.stopPropagation(); removePending(f.name); }} className="ml-2 shrink-0 text-slate-400 hover:text-rose-600" aria-label={`remove ${f.name}`}>✕</button>
+                </li>
+              ))}
+            </ul>
+          )}
+
+          <button
+            onClick={handleScreen}
+            disabled={pending.length === 0 || isScreening}
+            className="mt-3 w-full rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 disabled:cursor-not-allowed disabled:bg-slate-300"
+          >
+            {isScreening ? "Screening…" : pending.length === 0 ? "Screen CVs" : `Screen ${pending.length} CV${pending.length === 1 ? "" : "s"}`}
+          </button>
+
+          {progress && (
+            <div className="mt-3">
+              <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-200">
+                <div className="h-full rounded-full bg-indigo-500 transition-all" style={{ width: `${progress.total ? (progress.done / progress.total) * 100 : 0}%` }} />
+              </div>
+              <p className="mt-1 text-xs text-slate-500">{progress.done} of {progress.total} screened</p>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ---------------------------------------------------------------------
+    // Filter bar
+    // ---------------------------------------------------------------------
+    const RECOMMENDATION_OPTIONS = [
+      { value: "all", label: "All" },
+      { value: "advance", label: "Advance" },
+      { value: "hold", label: "Hold" },
+      { value: "reject", label: "Reject" },
+    ];
+
+    function FilterBar(props) {
+      const { search, onSearchChange, recommendationFilter, onRecommendationFilterChange, humanReviewOnly, onHumanReviewOnlyChange, sortKey, onSortKeyChange, visibleCount, totalCount } = props;
+      return (
+        <div className="flex flex-wrap items-center gap-3 rounded-lg border border-slate-200 bg-white p-3 shadow-sm">
+          <input
+            type="search"
+            value={search}
+            onChange={(e) => onSearchChange(e.target.value)}
+            placeholder="Search by candidate name…"
+            className="min-w-[200px] flex-1 rounded-md border border-slate-300 px-3 py-1.5 text-sm placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+          />
+          <div className="flex rounded-md border border-slate-300 p-0.5">
+            {RECOMMENDATION_OPTIONS.map((opt) => (
+              <button
+                key={opt.value}
+                onClick={() => onRecommendationFilterChange(opt.value)}
+                className={`rounded px-2.5 py-1 text-xs font-medium transition-colors ${recommendationFilter === opt.value ? "bg-indigo-600 text-white" : "text-slate-600 hover:bg-slate-100"}`}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+          <label className="flex items-center gap-1.5 text-xs font-medium text-slate-600">
+            <input type="checkbox" checked={humanReviewOnly} onChange={(e) => onHumanReviewOnlyChange(e.target.checked)} className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500" />
+            Needs human review only
+          </label>
+          <select
+            value={sortKey}
+            onChange={(e) => onSortKeyChange(e.target.value)}
+            className="rounded-md border border-slate-300 px-2 py-1.5 text-xs font-medium text-slate-600 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+          >
+            <option value="score_desc">Score: high to low</option>
+            <option value="score_asc">Score: low to high</option>
+            <option value="name_asc">Name: A to Z</option>
+          </select>
+          <span className="ml-auto text-xs text-slate-400">{visibleCount} of {totalCount} shown</span>
+        </div>
+      );
+    }
+
+    // ---------------------------------------------------------------------
+    // Shortlist table
+    // ---------------------------------------------------------------------
+    function ShortlistTable({ candidates, selectedId, onSelect, onRetry }) {
+      if (candidates.length === 0) {
+        return (
+          <div className="flex flex-col items-center justify-center rounded-lg border border-dashed border-slate-300 bg-white py-16 text-center">
+            <p className="text-sm font-medium text-slate-600">No candidates yet</p>
+            <p className="mt-1 text-xs text-slate-400">Import CVs on the left to build the shortlist.</p>
+          </div>
+        );
+      }
+      return (
+        <div className="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm">
+          <table className="min-w-full divide-y divide-slate-200">
+            <thead className="bg-slate-50">
+              <tr>
+                <th className="w-10 px-4 py-2 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">#</th>
+                <th className="px-4 py-2 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">Candidate</th>
+                <th className="px-4 py-2 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">Score</th>
+                <th className="px-4 py-2 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">Recommendation</th>
+                <th className="px-4 py-2 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">Flags</th>
+                <th className="px-4 py-2 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">File</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {candidates.map((c, i) => (
+                <Row key={c.id} rank={i + 1} candidate={c} selected={c.id === selectedId} onSelect={onSelect} onRetry={onRetry} />
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    function Row({ rank, candidate, selected, onSelect, onRetry }) {
+      const { id, filename, status, card, error } = candidate;
+
+      if (status === "pending" || status === "screening") {
+        return (
+          <tr className="bg-white">
+            <td className="px-4 py-3 text-sm text-slate-400">{rank}</td>
+            <td className="px-4 py-3 text-sm text-slate-500" colSpan={4}>
+              <span className="inline-flex items-center gap-2">
+                <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-slate-300 border-t-indigo-500" />
+                {status === "screening" ? "Screening…" : "Queued…"}
+              </span>
+            </td>
+            <td className="px-4 py-3 text-xs text-slate-400">{filename}</td>
+          </tr>
+        );
+      }
+
+      if (status === "error") {
+        return (
+          <tr className="bg-rose-50/40">
+            <td className="px-4 py-3 text-sm text-slate-400">{rank}</td>
+            <td className="px-4 py-3 text-sm text-rose-700" colSpan={4}>
+              <span className="font-medium">Failed:</span> {error}
+              <button onClick={() => onRetry(id)} className="ml-3 rounded border border-rose-300 px-2 py-0.5 text-xs font-medium text-rose-700 hover:bg-rose-100">Retry</button>
+            </td>
+            <td className="px-4 py-3 text-xs text-slate-400">{filename}</td>
+          </tr>
+        );
+      }
+
+      if (!card) return null;
+      const criticalCount = card.findings.filter((f) => f.is_critical).length;
+
+      return (
+        <tr onClick={() => onSelect(id)} className={`cursor-pointer transition-colors ${selected ? "bg-indigo-50" : "bg-white hover:bg-slate-50"}`}>
+          <td className="px-4 py-3 text-sm text-slate-400">{rank}</td>
+          <td className="px-4 py-3">
+            <div className="text-sm font-medium text-slate-900">{card.candidate_name}</div>
+            <div className="line-clamp-1 max-w-xs text-xs text-slate-500">{card.summary}</div>
+          </td>
+          <td className="px-4 py-3"><ScoreBar score={card.overall_score} recommendation={card.recommendation} /></td>
+          <td className="px-4 py-3">
+            <div className="flex flex-col items-start gap-1">
+              <RecommendationBadge value={card.recommendation} />
+              {card.requires_human_review && <HumanReviewBadge />}
+            </div>
+          </td>
+          <td className="px-4 py-3 text-sm text-slate-600">
+            {criticalCount > 0 ? <span className="font-medium text-amber-700">{criticalCount} critical</span> : <span className="text-slate-400">—</span>}
+            {card.hard_blockers.length > 0 && <div className="text-xs font-medium text-rose-600">{card.hard_blockers.length} hard blocker(s)</div>}
+          </td>
+          <td className="px-4 py-3 text-xs text-slate-400">{filename}</td>
+        </tr>
+      );
+    }
+
+    // ---------------------------------------------------------------------
+    // Candidate detail
+    // ---------------------------------------------------------------------
+    function CandidateDetail({ candidate, criteria, onClose }) {
+      useEffect(() => {
+        function onKey(e) { if (e.key === "Escape") onClose(); }
+        window.addEventListener("keydown", onKey);
+        return () => window.removeEventListener("keydown", onKey);
+      }, [onClose]);
+
+      if (!candidate || !candidate.card) return null;
+      const card = candidate.card;
+      const weightByKey = new Map(criteria.map((c) => [c.key, c.weight]));
+      const labelByKey = new Map(criteria.map((c) => [c.key, c.label]));
+
+      return (
+        <div className="fixed inset-0 z-40 flex justify-end">
+          <div className="absolute inset-0 bg-slate-900/30" onClick={onClose} />
+          <div className="relative flex h-full w-full max-w-2xl flex-col overflow-y-auto bg-white shadow-xl">
+            <div className="sticky top-0 z-10 flex items-start justify-between border-b border-slate-200 bg-white px-6 py-4">
+              <div>
+                <h2 className="text-lg font-bold text-slate-900">{card.candidate_name}</h2>
+                <p className="text-sm text-slate-500">{card.role}</p>
+              </div>
+              <button onClick={onClose} className="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600" aria-label="Close">✕</button>
+            </div>
+
+            <div className="space-y-6 px-6 py-5">
+              <div className="flex flex-wrap items-center gap-3">
+                <div className="text-3xl font-bold tabular-nums text-slate-900">{card.overall_score}<span className="text-base font-normal text-slate-400">/100</span></div>
+                <RecommendationBadge value={card.recommendation} />
+                {card.requires_human_review && <HumanReviewBadge />}
+              </div>
+
+              <section>
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Summary</h3>
+                <p className="mt-1 text-sm text-slate-700">{card.summary}</p>
+              </section>
+
+              {card.hard_blockers.length > 0 && (
+                <section className="rounded-md border border-rose-200 bg-rose-50 p-3">
+                  <h3 className="text-xs font-semibold uppercase tracking-wide text-rose-700">Hard blockers</h3>
+                  <ul className="mt-1 list-disc space-y-0.5 pl-4 text-sm text-rose-800">
+                    {card.hard_blockers.map((b, i) => <li key={i}>{b}</li>)}
+                  </ul>
+                </section>
+              )}
+
+              <section>
+                <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Findings by criterion</h3>
+                <div className="space-y-3">
+                  {card.findings.map((f) => (
+                    <div key={f.criterion} className="rounded-md border border-slate-200 p-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="text-sm font-medium text-slate-900">
+                          {labelByKey.get(f.criterion) ?? f.criterion}
+                          <span className="ml-1.5 text-xs font-normal text-slate-400">weight {weightByKey.get(f.criterion) ?? "?"}</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <VerdictBadge value={f.verdict} />
+                          <span className="text-sm font-semibold tabular-nums text-slate-700">{f.score}/100</span>
+                          {f.is_critical && <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800">critical</span>}
+                        </div>
+                      </div>
+                      <p className="mt-2 border-l-2 border-slate-200 pl-2 text-sm italic text-slate-600">“{f.evidence}”</p>
+                      {f.is_critical && f.recruiter_note && (
+                        <p className="mt-2 rounded bg-amber-50 px-2 py-1.5 text-sm text-amber-900">
+                          <span className="font-semibold">Recruiter note (proposal, needs approval): </span>{f.recruiter_note}
+                        </p>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </section>
+
+              {card.missing_information.length > 0 && (
+                <section>
+                  <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Missing information</h3>
+                  <ul className="mt-1 list-disc space-y-0.5 pl-4 text-sm text-slate-700">
+                    {card.missing_information.map((m, i) => <li key={i}>{m}</li>)}
+                  </ul>
+                </section>
+              )}
+
+              {card.interview_probes.length > 0 && (
+                <section>
+                  <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Interview probes</h3>
+                  <ul className="mt-1 list-disc space-y-0.5 pl-4 text-sm text-slate-700">
+                    {card.interview_probes.map((p, i) => <li key={i}>{p}</li>)}
+                  </ul>
+                </section>
+              )}
+
+              {card.guardrail_violations.length > 0 && (
+                <section className="rounded-md border border-purple-200 bg-purple-50 p-3">
+                  <h3 className="text-xs font-semibold uppercase tracking-wide text-purple-700">Guardrail actions taken</h3>
+                  <ul className="mt-1 list-disc space-y-0.5 pl-4 text-sm text-purple-800">
+                    {card.guardrail_violations.map((v, i) => <li key={i}>{v}</li>)}
+                  </ul>
+                </section>
+              )}
+
+              <p className="border-t border-slate-100 pt-3 text-xs text-slate-400">
+                This scorecard is a recruiter aid, not a decision — every result, especially a reject, should be reviewed by a human before acting on it.
+              </p>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ---------------------------------------------------------------------
+    // App
+    // ---------------------------------------------------------------------
+    const STORAGE_KEY = "cv-screener:candidates";
+    const MAX_CONCURRENT = 3;
+
+    function loadStoredCandidates() {
+      try {
+        const raw = sessionStorage.getItem(STORAGE_KEY);
+        if (!raw) return [];
+        const parsed = JSON.parse(raw);
+        return parsed.map((c) => (c.status === "pending" || c.status === "screening") ? { ...c, status: "error", error: "interrupted by page reload" } : c);
+      } catch {
+        return [];
+      }
+    }
+
+    function App() {
+      const [candidates, setCandidates] = useState(loadStoredCandidates);
+      const [health, setHealth] = useState(null);
+      const [healthError, setHealthError] = useState(null);
+      const [isScreening, setIsScreening] = useState(false);
+      const [progress, setProgress] = useState(null);
+      const [selectedId, setSelectedId] = useState(null);
+
+      const [search, setSearch] = useState("");
+      const [recommendationFilter, setRecommendationFilter] = useState("all");
+      const [humanReviewOnly, setHumanReviewOnly] = useState(false);
+      const [sortKey, setSortKey] = useState("score_desc");
+
+      useEffect(() => {
+        fetchHealth().then(setHealth).catch((e) => setHealthError(e instanceof Error ? e.message : "could not reach backend"));
+      }, []);
+
+      useEffect(() => {
+        try { sessionStorage.setItem(STORAGE_KEY, JSON.stringify(candidates)); } catch {}
+      }, [candidates]);
+
+      function updateCandidate(id, patch) {
+        setCandidates((prev) => prev.map((c) => (c.id === id ? { ...c, ...patch } : c)));
+      }
+
+      async function screenOne(entry) {
+        updateCandidate(entry.id, { status: "screening" });
+        const res = await screenText(entry.filename, entry.cvText);
+        if (res.status === "ok" && res.card) {
+          updateCandidate(entry.id, { status: "ok", card: res.card, error: null });
+        } else {
+          updateCandidate(entry.id, { status: "error", error: res.error ?? "unknown error" });
+        }
+        setProgress((p) => (p ? { done: p.done + 1, total: p.total } : p));
+      }
+
+      async function handleScreen(files) {
+        const entries = await Promise.all(files.map(async (f) => ({
+          id: newId(), filename: f.name, cvText: await readFileAsText(f).catch(() => ""), status: "pending", card: null, error: null,
+        })));
+        setCandidates((prev) => [...prev, ...entries]);
+        setIsScreening(true);
+        setProgress({ done: 0, total: entries.length });
+        await runPool(entries, MAX_CONCURRENT, screenOne);
+        setIsScreening(false);
+        setProgress(null);
+      }
+
+      async function handleRetry(id) {
+        const target = candidates.find((c) => c.id === id);
+        if (!target) return;
+        await screenOne(target);
+      }
+
+      function handleClear() {
+        setCandidates([]);
+        setSelectedId(null);
+      }
+
+      const filtered = useMemo(() => {
+        const q = search.trim().toLowerCase();
+        return candidates.filter((c) => {
+          if (c.status !== "ok" || !c.card) return true;
+          if (q && !c.card.candidate_name.toLowerCase().includes(q)) return false;
+          if (recommendationFilter !== "all" && c.card.recommendation !== recommendationFilter) return false;
+          if (humanReviewOnly && !c.card.requires_human_review) return false;
+          return true;
+        });
+      }, [candidates, search, recommendationFilter, humanReviewOnly]);
+
+      const sorted = useMemo(() => {
+        const ok = filtered.filter((c) => c.status === "ok" && c.card);
+        const rest = filtered.filter((c) => !(c.status === "ok" && c.card));
+        ok.sort((a, b) => {
+          const ca = a.card, cb = b.card;
+          if (sortKey === "score_desc") return cb.overall_score - ca.overall_score;
+          if (sortKey === "score_asc") return ca.overall_score - cb.overall_score;
+          return ca.candidate_name.localeCompare(cb.candidate_name);
+        });
+        return [...ok, ...rest];
+      }, [filtered, sortKey]);
+
+      const selected = candidates.find((c) => c.id === selectedId) ?? null;
+      const criteria = health?.criteria ?? [];
+
+      return (
+        <div className="min-h-screen">
+          <Header health={health} />
+          <main className="mx-auto max-w-7xl px-6 py-6">
+            {healthError && (
+              <div className="mb-4 rounded-md bg-rose-50 px-3 py-2 text-sm text-rose-800 ring-1 ring-inset ring-rose-600/20">
+                Can't reach the backend at {API_BASE} ({healthError}). Start it with{" "}
+                <code className="rounded bg-rose-100 px-1 py-0.5">uvicorn api:app --reload --port 8000</code>.
+              </div>
+            )}
+            <div className="grid grid-cols-1 gap-6 lg:grid-cols-[280px_1fr]">
+              <div className="lg:sticky lg:top-6 lg:self-start">
+                <UploadPanel onScreen={handleScreen} isScreening={isScreening} progress={progress} candidateCount={candidates.length} onClear={handleClear} />
+              </div>
+              <div className="space-y-4">
+                <FilterBar
+                  search={search} onSearchChange={setSearch}
+                  recommendationFilter={recommendationFilter} onRecommendationFilterChange={setRecommendationFilter}
+                  humanReviewOnly={humanReviewOnly} onHumanReviewOnlyChange={setHumanReviewOnly}
+                  sortKey={sortKey} onSortKeyChange={setSortKey}
+                  visibleCount={sorted.length} totalCount={candidates.length}
+                />
+                <ShortlistTable candidates={sorted} selectedId={selectedId} onSelect={setSelectedId} onRetry={handleRetry} />
+              </div>
+            </div>
+          </main>
+          <CandidateDetail candidate={selected} criteria={criteria} onClose={() => setSelectedId(null)} />
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
